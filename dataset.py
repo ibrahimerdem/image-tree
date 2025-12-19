@@ -73,12 +73,10 @@ class ConditionalImageDataset(Dataset):
         self.input_size = input_size
         self.output_size = output_size
         self.mode = mode
-        
-        # Shared image directories
+
         self.initial_dir = os.path.join(data_dir, initial_dir)
         self.target_dir = os. path.join(data_dir, target_dir)
-        
-        # Feature file path
+
         self.features_file = os.path.join(data_dir, features_file)
         
         # Validate paths
@@ -93,22 +91,13 @@ class ConditionalImageDataset(Dataset):
         self.features_df = pd.read_csv(self.features_file)
         
         # Check CSV format - determine if it has separate initial/target columns
-        columns = self.features_df.columns. tolist()
+        columns = self.features_df.columns.tolist()
         
         if 'initial_filename' in columns and 'target_filename' in columns:
-            # Format with different filenames
             self.initial_filenames = self.features_df['initial_filename'].tolist()
             self.target_filenames = self.features_df['target_filename'].tolist()
             self.paired_format = True
             condition_cols = [col for col in columns if col not in ['initial_filename', 'target_filename']]
-            print(f"[{mode.upper()}] Using paired format (initial_filename, target_filename)")
-        elif 'filename' in columns: 
-            # Format with same filename for both
-            self.initial_filenames = self.features_df['filename'].tolist()
-            self.target_filenames = self. features_df['filename'].tolist()
-            self.paired_format = False
-            condition_cols = [col for col in columns if col != 'filename']
-            print(f"[{mode.upper()}] Using single filename format")
         else:
             raise ValueError(
                 "CSV must contain either:\n"

@@ -1,8 +1,3 @@
-"""
-Training script for High-Resolution Conditional Image Generator
-Optimized for 2x36GB GPUs with file-based logging
-"""
-
 import os
 import argparse
 import torch

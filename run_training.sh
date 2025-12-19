@@ -25,22 +25,22 @@ echo ""
 
 # Check if data exists
 if [ ! -d "data/initial" ] || [ ! -d "data/target" ]; then
-    echo "❌ Error: Data directories not found!"
+    echo "Error: Data directories not found!"
     echo "Expected: data/initial/ and data/target/"
     exit 1
 fi
 
 if [ ! -f "data/training_features.csv" ] || [ ! -f "data/validation_features.csv" ]; then
-    echo "❌ Error: CSV files not found!"
+    echo "Error: CSV files not found!"
     echo "Expected: data/training_features.csv and data/validation_features.csv"
     exit 1
 fi
 
-echo "✓ Data directories found"
-echo "  - Initial images: $(ls data/initial/ | wc -l) files"
-echo "  - Target images: $(ls data/target/ | wc -l) files"
-echo "  - Training samples: $(($(wc -l < data/training_features.csv) - 1))"
-echo "  - Validation samples: $(($(wc -l < data/validation_features.csv) - 1))"
+echo "Data directories found"
+echo " - Initial images: $(ls data/initial/ | wc -l) files"
+echo " - Target images: $(ls data/target/ | wc -l) files"
+echo " - Training samples: $(($(wc -l < data/training_features.csv) - 1))"
+echo " - Validation samples: $(($(wc -l < data/validation_features.csv) - 1))"
 echo ""
 
 # Create output directories
