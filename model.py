@@ -1,11 +1,14 @@
 """
-Conditional Image Generator Model - Optimized for High Resolution
+Conditional Image Generator Model - Uses Pretrained Encoder
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, List
+from typing import Tuple, List, Dict
+import config as cfg
+from pretrained_encoder import PretrainedEncoderWrapper
+import os
 
 
 class ResidualBlock(nn.Module):
@@ -29,32 +32,38 @@ class ResidualBlock(nn.Module):
 
 
 class ImageEncoder(nn.Module):
-    """Memory-efficient image encoder for high-resolution images"""
+    """
+    Wrapper for pretrained encoder (encoder_epoch_50.pth)
+    Takes 128x128 images and outputs features
+    """
     
-    def __init__(self, in_channels: int = 3, channels: List[int] = [64, 128, 256, 256]):
+    def __init__(self, checkpoint_path: str = 'encoder_epoch_50.pth', device: str = 'cuda:0'):
         super().__init__()
+        self.encoder_wrapper = PretrainedEncoderWrapper(checkpoint_path, device)
+        self.device = device
         
-        layers = []
-        prev_channels = in_channels
+        # Freeze encoder (no training)
+        for param in self.encoder_wrapper.encoder.parameters():
+            param.requires_grad = False
+    
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass through pretrained encoder
         
-        for i, out_channels in enumerate(channels):
-            # Downsampling layer
-            layers.extend([
-                nn.Conv2d(prev_channels, out_channels, kernel_size=4, stride=2, padding=1),
-                nn.BatchNorm2d(out_channels),
-                nn.LeakyReLU(0.2, inplace=True)
-            ])
+        Args:
+            x: Input images [B, 3, 128, 128]
             
-            # Add residual block for deeper layers
-            if i >= 2:  # Add residual blocks from 3rd layer onwards
-                layers.append(ResidualBlock(out_channels))
-            
-            prev_channels = out_channels
+        Returns:
+            Dict with global and local features
+        """
+        # Ensure input is on correct device
+        if x.device != self.device:
+            x = x.to(self.device)
         
-        self.encoder = nn.Sequential(*layers)
+        with torch.no_grad():
+            features = self.encoder_wrapper.encode(x)
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder(x)
+        return features
 
 
 class ConditionEncoder(nn.Module):
@@ -129,38 +138,38 @@ class SelfAttention(nn.Module):
 
 
 class Decoder(nn.Module):
-    """Memory-efficient decoder with residual connections and self-attention"""
+    """Deep decoder with ConvTranspose2d upsampling, 7 levels from 4x4 to 512x512"""
     
-    def __init__(self, in_channels: int, channels: List[int] = [256, 256, 128, 64], out_channels: int = 3, use_attention: bool = True):
+    def __init__(self, in_channels: int, channels: List[int] = [1024, 512, 256, 128, 64, 32, 16], out_channels: int = 3, use_attention: bool = True):
         super().__init__()
         self.use_attention = use_attention
         
-        # Build decoder layers
+        # Decoder progression: 4x4 -> 8x8 -> 16x16 -> 32x32 -> 64x64 -> 128x128 -> 256x256 -> 512x512
+        # 7 levels of deconv (2^7 = 128x total upsampling)
         self.layers = nn.ModuleList()
         prev_channels = in_channels
-        
+
         for i, out_ch in enumerate(channels):
-            # Upsampling layer
-            upsample_block = nn.Sequential(
-                nn.ConvTranspose2d(prev_channels, out_ch, kernel_size=4, stride=2, padding=1),
+            # ConvTranspose2d: kernel_size=4, stride=2, padding=1 for 2x spatial upsampling
+            deconv_block = nn.Sequential(
+                nn.ConvTranspose2d(prev_channels, out_ch, kernel_size=4, stride=2, padding=1, bias=False),
                 nn.BatchNorm2d(out_ch),
                 nn.ReLU(inplace=True)
             )
-            self.layers.append(upsample_block)
-            
-            # Add self-attention after first upsampling (at 32x32 or 64x64 resolution)
-            if use_attention and i == 1:  # Add attention after 2nd layer
+            self.layers.append(deconv_block)
+
+            # Add self-attention after 3rd upsampling (at 32x32 resolution)
+            if use_attention and i == 2:  # After 3rd deconv layer
                 self.layers.append(SelfAttention(out_ch))
-            
-            # Add residual block for earlier layers
-            if i < len(channels) - 2: 
-                self.layers.append(ResidualBlock(out_ch))
-            
+
+            # Add residual block for all layers to maintain detail and prevent artifacts
+            self.layers.append(ResidualBlock(out_ch))
+
             prev_channels = out_ch
         
-        # Final upsampling to output resolution
+        # Final layer to output resolution (512x512) with Conv2d
         self.final_layer = nn.Sequential(
-            nn.ConvTranspose2d(prev_channels, out_channels, kernel_size=4, stride=2, padding=1),
+            nn.Conv2d(prev_channels, out_channels, kernel_size=3, padding=1),
             nn.Tanh()
         )
         
@@ -215,10 +224,13 @@ class ConditionalImageGenerator(nn.Module):
         input_size: int = 128,
         output_size: int = 512,
         latent_dim: int = 256,
-        encoder_channels: List[int] = [64, 128, 256],
-        decoder_channels: List[int] = [256, 128, 64, 32],
+        encoder_channels: List[int] = [64, 128, 256, 256, 256],
+        decoder_channels: List[int] = [1024, 512, 256, 128, 64, 32, 16],
         condition_hidden_dims:  List[int] = [64, 128, 256],
-        use_checkpoint: bool = False
+        use_vae: bool = False,
+        use_checkpoint: bool = False,
+        encoder_checkpoint: str = 'encoder_epoch_50.pth',
+        device: str = 'cuda:0'
     ):
         super().__init__()
         
@@ -227,77 +239,140 @@ class ConditionalImageGenerator(nn.Module):
         self.latent_dim = latent_dim
         self.num_conditions = num_conditions
         self.use_checkpoint = use_checkpoint
+        self.use_vae = use_vae
+        self.vae_latent_dim = latent_dim
+        self.device = device
         
-        # Calculate spatial size after encoding (128 -> 64 -> 32 -> 16)
-        self.spatial_size = input_size // (2 ** len(encoder_channels))
+        # Pretrained encoder takes 128x128 images
+        # If input_size > 128, we'll resize during forward pass
+        self.encoder_input_size = 128
         
-        # Encoders
-        self.image_encoder = ImageEncoder(in_channels=3, channels=encoder_channels)
+        # Load pretrained encoder (frozen, no gradients)
+        self.image_encoder = PretrainedEncoderWrapper(encoder_checkpoint, device=device)
+        
+        # Condition encoder (trainable)
         self.condition_encoder = ConditionEncoder(
             num_conditions=num_conditions,
             hidden_dims=condition_hidden_dims
         )
         
-        # Fusion layer to reduce concatenated channels
-        concat_channels = encoder_channels[-1] + condition_hidden_dims[-1]
-        self.fusion = nn.Sequential(
-            nn.Conv2d(concat_channels, encoder_channels[-1], 1),
-            nn.BatchNorm2d(encoder_channels[-1]),
+        # Spatial size after pretrained encoder: 128 -> 4x4 local features
+        # Global features: 512D vector
+        self.spatial_size = 4
+        
+        # Fusion layer: combine global features with conditions
+        # Global features: 512D, Conditions: 256D
+        concat_channels = 512 + condition_hidden_dims[-1]
+        self.fusion_global = nn.Sequential(
+            nn.Linear(concat_channels, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, 512)
+        )
+        
+        # Expand global features to 4x4 spatial map for decoder
+        self.expand_spatial = nn.Sequential(
+            nn.Linear(512, 256 * 4 * 4),
             nn.ReLU(inplace=True)
         )
+
+        # VAE heads (spatial latent map) - optional
+        if self.use_vae:
+            self.mu_conv = nn.Conv2d(256, self.vae_latent_dim, kernel_size=1)
+            self.logvar_conv = nn.Conv2d(256, self.vae_latent_dim, kernel_size=1)
+            decoder_in_channels = 256 + self.vae_latent_dim
+        else:
+            decoder_in_channels = 256
         
         # Decoder with self-attention
         self.decoder = Decoder(
-            in_channels=encoder_channels[-1],
+            in_channels=decoder_in_channels,
             channels=decoder_channels,
             out_channels=3,
-            use_attention=True  # Enable self-attention
+            use_attention=True
         )
         
-    def forward(self, image: torch.Tensor, conditions: torch.Tensor) -> torch.Tensor:
+    def forward(self, image: torch.Tensor, conditions: torch.Tensor) -> Tuple:
         """
-        Forward pass
+        Forward pass using pretrained encoder
         
         Args:
-            image: Input image tensor [B, 3, 128, 128]
+            image: Input image tensor [B, 3, H, W] (will be resized to 128x128 for encoder)
             conditions: Condition features [B, num_conditions]
             
         Returns:
-            Generated image [B, 3, 512, 512] (4x upscaled)
+            Generated image [B, 3, 512, 512]
+            If VAE: (image, mu, logvar)
         """
         batch_size = image.size(0)
         
-        # Encode image with gradient checkpointing if enabled
-        if self.use_checkpoint and self.training:
-            encoded_image = torch.utils.checkpoint.checkpoint(
-                self.image_encoder, image, use_reentrant=False, preserve_rng_state=True
-            )
-        else:
-            encoded_image = self.image_encoder(image)
+        # Resize image to 128x128 if needed (pretrained encoder expects 128x128)
+        if image.shape[-1] != self.encoder_input_size or image.shape[-2] != self.encoder_input_size:
+            image = F.interpolate(image, size=(self.encoder_input_size, self.encoder_input_size), 
+                                mode='bilinear', align_corners=False)
+        
+        # Encode image with pretrained encoder (no gradients)
+        encoded_features = self.image_encoder(image)
+        
+        # Extract global and local features
+        global_feat = encoded_features['global']  # [B, 512]
+        local_feat = encoded_features['local']    # [B, 512, 4, 4]
         
         # Encode conditions
-        encoded_conditions = self.condition_encoder(conditions)
+        encoded_conditions = self.condition_encoder(conditions)  # [B, 256]
         
-        # Reshape conditions to match spatial dimensions
-        encoded_conditions = encoded_conditions.view(
-            batch_size, -1, 1, 1
-        ).expand(
-            batch_size, -1, self.spatial_size, self.spatial_size
-        )
+        # Fuse global features with conditions
+        combined = torch.cat([global_feat, encoded_conditions], dim=1)  # [B, 768]
+        fused_global = self.fusion_global(combined)  # [B, 512]
         
-        # Concatenate and fuse
-        combined = torch.cat([encoded_image, encoded_conditions], dim=1)
-        fused = self.fusion(combined)
-        
-        # Decode with gradient checkpointing if enabled
-        if self.use_checkpoint and self.training:
-            output_image = torch.utils.checkpoint.checkpoint(
-                self.decoder, fused, use_reentrant=False, preserve_rng_state=True
-            )
+        # Expand to spatial map for decoder input
+        spatial_feat = self.expand_spatial(fused_global)  # [B, 256*16]
+        spatial_feat = spatial_feat.view(batch_size, 256, 4, 4)  # [B, 256, 4, 4]
+
+        # If using VAE, compute mu/logvar and sample spatial latent
+        if self.use_vae and self.training:
+            mu = self.mu_conv(spatial_feat)
+            logvar = self.logvar_conv(spatial_feat)
+            z = self.reparameterize(mu, logvar)
+            decoder_input = torch.cat([spatial_feat, z], dim=1)
+        elif self.use_vae and not self.training:
+            mu = self.mu_conv(spatial_feat)
+            logvar = self.logvar_conv(spatial_feat)
+            z = mu  # Deterministic in eval mode
+            decoder_input = torch.cat([spatial_feat, z], dim=1)
         else:
-            output_image = self.decoder(fused)
-        
+            decoder_input = spatial_feat
+            mu = None
+            logvar = None
+
+        # Decode to 512x512
+        output_image = self.decoder(decoder_input)
+
+        # If VAE enabled, return (output, mu, logvar) for KL computation
+        if self.use_vae:
+            return output_image, mu, logvar
+
         return output_image
+
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """Reparameterization trick for sampling z from mu/logvar (spatial map)."""
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    @staticmethod
+    def kl_divergence(mu: torch.Tensor, logvar: torch.Tensor, reduction: str = 'mean') -> torch.Tensor:
+        """Compute KL divergence between N(mu, sigma) and N(0, I).
+
+        Returns a scalar tensor.
+        """
+        # KL per element
+        kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+        if reduction == 'sum':
+            return kl.sum()
+        elif reduction == 'mean':
+            return kl.sum(dim=[1, 2, 3]).mean()
+        else:
+            return kl
     
     def get_num_parameters(self) -> int:
         """Get total number of trainable parameters"""
@@ -305,7 +380,7 @@ class ConditionalImageGenerator(nn.Module):
 
 
 def test_model():
-    """Test model with 128->256 upscaling - GPU safe, no CPU usage"""
+    """Test model with 256->512 upscaling - GPU safe, no CPU usage"""
     print(f"\nTesting Image Generator Model")
     print("="*60)
     
@@ -327,8 +402,8 @@ def test_model():
         num_conditions=num_conditions,
         input_size=input_size,
         output_size=output_size,
-        encoder_channels=[64, 128, 256],
-        decoder_channels=[256, 128, 64, 32],
+        encoder_channels=[64, 128, 256, 256, 256],
+        decoder_channels=[1024, 512, 256, 128, 64, 32, 16],
         condition_hidden_dims=[64, 128, 256],
         use_checkpoint=False
     ).to(device)
@@ -341,6 +416,10 @@ def test_model():
         
         # Forward pass
         output = model(dummy_image, dummy_conditions)
+        if isinstance(output, tuple):
+            output_image = output[0]
+        else:
+            output_image = output
     
     print(f"\nModel Architecture:")
     print(f"  Input size:  {input_size}x{input_size}")
@@ -350,7 +429,7 @@ def test_model():
     
     print(f"\nTest Results:")
     print(f"  Input shape:  {tuple(dummy_image.shape)}")
-    print(f"  Output shape: {tuple(output.shape)}")
+    print(f"  Output shape: {tuple(output_image.shape)}")
     print(f"  Total parameters: {model.get_num_parameters():,}")
     
     # Calculate memory usage
@@ -365,10 +444,10 @@ def test_model():
     
     # Verify output shape
     expected_shape = (batch_size, 3, output_size, output_size)
-    assert output.shape == expected_shape, f"Output shape mismatch! Expected {expected_shape}, got {output.shape}"
+    assert output_image.shape == expected_shape, f"Output shape mismatch! Expected {expected_shape}, got {output_image.shape}"
     
     # Cleanup
-    del model, dummy_image, dummy_conditions, output
+    del model, dummy_image, dummy_conditions, output, output_image
     torch.cuda.empty_cache()
     
     print("\nModel tests passed!")

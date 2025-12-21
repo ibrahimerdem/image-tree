@@ -35,6 +35,8 @@ def get_args():
     
     # Model
     parser.add_argument('--latent_dim', type=int, default=cfg.LATENT_DIM)
+    parser.add_argument('--use_vae', action='store_true', default=cfg.ENABLE_VAE,
+                        help='Enable conditional VAE with KL loss')
     parser.add_argument('--use_perceptual', action='store_true', default=True,
                         help='Use perceptual loss')
     
@@ -117,7 +119,9 @@ def train_epoch(
     epoch: int,
     gradient_accumulation_steps: int,
     rank: int,
-    use_perceptual: bool = False
+    use_perceptual: bool = False,
+    use_vae: bool = False,
+    epoch_for_kl: int = 0
 ) -> dict:
     """Train for one epoch"""
     model.train()
@@ -144,20 +148,42 @@ def train_epoch(
         
         # Forward pass with mixed precision
         with autocast(device_type='cuda', enabled=cfg.USE_AMP):
-            generated_images = model(initial_images, conditions)
-            
+            if use_vae:
+                out = model(initial_images, conditions)
+                # model returns (generated_images, mu, logvar)
+                if isinstance(out, tuple):
+                    generated_images, mu, logvar = out
+                else:
+                    # fallback
+                    generated_images = out
+                    mu = None
+                    logvar = None
+            else:
+                generated_images = model(initial_images, conditions)
+                mu = None
+                logvar = None
+
             # Calculate losses
             mse_loss = criterion_mse(generated_images, target_images)
             l1_loss = criterion_l1(generated_images, target_images)
-            
-            total_loss = cfg.RECONSTRUCTION_WEIGHT * mse_loss + cfg. L1_WEIGHT * l1_loss
-            
+
+            total_loss = cfg.RECONSTRUCTION_WEIGHT * mse_loss + cfg.L1_WEIGHT * l1_loss
+
             # Add perceptual loss if enabled
             perceptual_loss = torch.tensor(0.0).to(device)
             if use_perceptual and criterion_perceptual is not None:
                 perceptual_loss = criterion_perceptual(generated_images, target_images)
                 total_loss += cfg.PERCEPTUAL_WEIGHT * perceptual_loss
-            
+
+            # KL divergence for VAE (if available)
+            kl_loss = torch.tensor(0.0).to(device)
+            if use_vae and mu is not None and logvar is not None:
+                # Sum over channels and spatial dims, average over batch
+                kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / mu.size(0)
+                # Anneal KL weight linearly over configured epochs
+                kl_weight = cfg.VAE_KL_WEIGHT * min(1.0, (epoch_for_kl + 1) / float(max(1, cfg.VAE_KL_ANNEAL_EPOCHS)))
+                total_loss += kl_weight * kl_loss
+
             # Normalize by accumulation steps
             total_loss = total_loss / gradient_accumulation_steps
         
@@ -178,6 +204,13 @@ def train_epoch(
         l1_meter.update(l1_loss.item(), initial_images.size(0))
         if use_perceptual: 
             perceptual_meter. update(perceptual_loss. item(), initial_images.size(0))
+        if use_vae:
+            # track kl (un-averaged per item)
+            try:
+                kl_val = kl_loss.item()
+            except:
+                kl_val = 0.0
+            # add kl to meters if desired (we'll reuse perceptual_meter or extend if needed)
         
         # Clear cache periodically
         if batch_idx % cfg.EMPTY_CACHE_FREQUENCY == 0:
@@ -210,7 +243,8 @@ def validate(
     device: str,
     epoch: int,
     rank: int,
-    use_perceptual: bool = True
+    use_perceptual: bool = True,
+    use_vae: bool = False
 ) -> dict:
     """Validate the model"""
     model.eval()
@@ -241,19 +275,31 @@ def validate(
         target_images = target_images.to(device, memory_format=torch.channels_last if cfg.CHANNELS_LAST else torch.contiguous_format)
         
         # Forward pass
-        generated_images = model(initial_images, conditions)
-        
+        out = model(initial_images, conditions)
+        if use_vae and isinstance(out, tuple):
+            generated_images, mu, logvar = out
+        else:
+            generated_images = out
+            mu = None
+            logvar = None
+
         # Calculate losses
         mse_loss = criterion_mse(generated_images, target_images)
         l1_loss = criterion_l1(generated_images, target_images)
-        
+
         total_loss = cfg.RECONSTRUCTION_WEIGHT * mse_loss + cfg.L1_WEIGHT * l1_loss
-        
+
         # Add perceptual loss if enabled
         perceptual_loss = torch.tensor(0.0).to(device)
         if use_perceptual and criterion_perceptual is not None:
             perceptual_loss = criterion_perceptual(generated_images, target_images)
             total_loss += cfg.PERCEPTUAL_WEIGHT * perceptual_loss
+
+        # KL divergence for VAE (include in validation loss)
+        if use_vae and mu is not None and logvar is not None:
+            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / mu.size(0)
+            # For validation use final weight (no annealing)
+            total_loss += cfg.VAE_KL_WEIGHT * kl_loss
         
         # Calculate metrics
         psnr_val = calculate_psnr(generated_images, target_images)
@@ -348,7 +394,10 @@ def train_worker(rank: int, world_size: int, args):
         encoder_channels=cfg.ENCODER_CHANNELS,
         decoder_channels=cfg.DECODER_CHANNELS,
         condition_hidden_dims=cfg.CONDITION_HIDDEN_DIMS,
-        use_checkpoint=True  # Enable gradient checkpointing for memory efficiency
+        use_vae=args.use_vae,
+        use_checkpoint=True,  # Enable gradient checkpointing for memory efficiency
+        encoder_checkpoint=cfg.ENCODER_CHECKPOINT,
+        device=f'cuda:{rank}'
     ).to(device)
     
     # Convert to channels_last for better performance
@@ -435,8 +484,8 @@ def train_worker(rank: int, world_size: int, args):
         # Train
         train_metrics = train_epoch(
             model, train_loader, criterion_mse, criterion_l1, criterion_perceptual,
-            optimizer, device, scaler, epoch, args.gradient_accumulation, 
-            rank, args.use_perceptual
+            optimizer, device, scaler, epoch, args.gradient_accumulation,
+            rank, args.use_perceptual, args.use_vae, epoch
         )
         
         # Validate only every N epochs
@@ -445,7 +494,7 @@ def train_worker(rank: int, world_size: int, args):
         if should_validate:
             val_metrics = validate(
                 model, val_loader, criterion_mse, criterion_l1, criterion_perceptual,
-                device, epoch, rank, args.use_perceptual
+                device, epoch, rank, args.use_perceptual, args.use_vae
             )
         else:
             # Skip validation, use None for metrics

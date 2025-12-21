@@ -17,3 +17,14 @@
 /src
 /.vscode
 **/__pycache__/
+
+# data
+/data
+/datasets
+/logs
+/results
+/samples
+
+# others
+commands.txt
+encoder_epoch_*.pth

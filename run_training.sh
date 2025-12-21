@@ -9,6 +9,7 @@ set -e
 NUM_GPUS=${1:-2}  # Default: 2 GPUs
 NUM_EPOCHS=${2:-200}  # Default: 200 epochs
 RESUME_CHECKPOINT=${3:-""}  # Optional: checkpoint path to resume from
+USE_VAE=${4:-"true"}  # Default: use VAE (true/false)
 
 echo "=========================================="
 echo "Image Generator Training"
@@ -17,6 +18,7 @@ echo "GPUs: $NUM_GPUS"
 echo "Epochs: $NUM_EPOCHS"
 echo "Input Size: 128x128"
 echo "Output Size: 512x512"
+echo "VAE Enabled: $USE_VAE"
 if [ -n "$RESUME_CHECKPOINT" ]; then
     echo "Resume from: $RESUME_CHECKPOINT"
 fi
@@ -64,6 +66,16 @@ if [ -n "$RESUME_CHECKPOINT" ]; then
     echo ""
 fi
 
+# Build VAE argument
+VAE_ARG=""
+if [ "$USE_VAE" = "true" ] || [ "$USE_VAE" = "1" ] || [ "$USE_VAE" = "yes" ]; then
+    VAE_ARG="--use_vae"
+    echo "✓ VAE enabled"
+else
+    echo "✓ VAE disabled"
+fi
+echo ""
+
 # Run training
 # Note: lr, batch_size, num_workers are now taken from config.py
 # Only override if you need different values
@@ -72,6 +84,7 @@ if [ $NUM_GPUS -eq 1 ]; then
     python3 train.py \
         --world_size 1 \
         --epochs $NUM_EPOCHS \
+        $VAE_ARG \
         $RESUME_ARG
 else
     echo "Starting distributed training on $NUM_GPUS GPUs with torchrun..."
@@ -82,6 +95,7 @@ else
         train.py \
         --world_size $NUM_GPUS \
         --epochs $NUM_EPOCHS \
+        $VAE_ARG \
         $RESUME_ARG
 fi
 

@@ -49,7 +49,7 @@ class ConditionalImageDataset(Dataset):
         target_dir: str = 'target',
         input_size: int = 128,
         output_size: int = 256,
-        normalize_conditions: bool = True,
+        normalize_conditions: bool = False,
         condition_stats: Optional[dict] = None,
         transform_input: Optional[transforms.Compose] = None,
         transform_output: Optional[transforms.Compose] = None,
