@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict, Optional
 
     
 class SelfAttention(nn.Module):
@@ -25,15 +26,58 @@ class SelfAttention(nn.Module):
         return out
 
 class Generator(nn.Module):
-    def __init__(self, conf, initial_image=False, image_encoder=None):
-        super(Generator, self).__init__()
-        self.channels = int(conf["image"]["n_channels"])
-        self.noise_dim = int(conf["model"]["noise_dim"])
-        self.embed_dim = int(conf["model"]["embed_dim"])
-        self.embed_out_dim = int(conf["model"]["embed_out_dim"])
-        self.input_features = conf["dataset"]["input_features"].split(",")
-        self.input_dim = len(self.input_features)
-        self.image_encoder = None
+    def __init__(
+        self,
+        conf: Optional[Dict] = None,
+        num_conditions: int = 9,
+        noise_dim: int = 100,
+        embed_dim: int = 256,
+        embed_out_dim: int = 128,
+        channels: int = 3,
+        use_initial_image: bool = True,
+        image_encoder: Optional[nn.Module] = None,
+        encoder_checkpoint: Optional[str] = None,
+        freeze_encoder: bool = True,
+        input_size: int = 128,
+        device: str = 'cuda:0'
+    ):
+        super().__init__()
+
+        if conf is not None:
+            channels = int(conf.get("image", {}).get("n_channels", channels))
+            noise_dim = int(conf.get("model", {}).get("noise_dim", noise_dim))
+            embed_dim = int(conf.get("model", {}).get("embed_dim", embed_dim))
+            embed_out_dim = int(conf.get("model", {}).get("embed_out_dim", embed_out_dim))
+            input_features = conf.get("dataset", {}).get("input_features", "")
+            if input_features:
+                num_conditions = len(input_features.split(","))
+            encoder_cfg = conf.get("model", {}).get("image_encoder", {})
+            use_initial_image = encoder_cfg.get("encoder_type") is not None or use_initial_image
+            encoder_checkpoint = encoder_cfg.get("encoder_path", encoder_checkpoint)
+            freeze_encoder = encoder_cfg.get("freeze_encoder", freeze_encoder)
+
+        self.channels = channels
+        self.noise_dim = noise_dim
+        self.embed_dim = embed_dim
+        self.embed_out_dim = embed_out_dim
+        self.input_dim = num_conditions
+        self.input_size = input_size
+        self.use_initial_image = use_initial_image
+        self.device = device
+
+        self.image_encoder = image_encoder if self.use_initial_image else None
+        if self.use_initial_image and self.image_encoder is None and encoder_checkpoint:
+            try:
+                from .pretrained_encoder import PretrainedEncoderWrapper
+                self.image_encoder = PretrainedEncoderWrapper(encoder_checkpoint, device=device)
+            except Exception as exc:
+                print(f"Warning: Failed to load pretrained encoder from {encoder_checkpoint}: {exc}")
+                self.image_encoder = None
+        if self.use_initial_image and self.image_encoder is not None and freeze_encoder:
+            self.freeze_image_encoder()
+
+        if self.use_initial_image and encoder_checkpoint:
+            print(f"Using pretrained encoder from: {encoder_checkpoint}")
 
         self.text_embedding = nn.Sequential(
             nn.Linear(self.input_dim , self.embed_dim),
@@ -46,17 +90,6 @@ class Generator(nn.Module):
 
         self.fc_no_image = nn.Linear(self.noise_dim + self.embed_out_dim, 1024 * 4 * 4)
         self.fc_with_image = nn.Linear(self.noise_dim + self.embed_out_dim + 512, 1024 * 4 * 4)
-
-        if initial_image:
-            encoder_type = conf["model"]["image_encoder"]["encoder_type"]
-            freeze_encoder = conf["model"]["image_encoder"]["freeze_encoder"]
-
-            encoder_path = conf["model"]["image_encoder"]["encoder_path"]
-            if image_encoder is not None:
-                self.image_encoder = image_encoder
-            if freeze_encoder:
-                self.freeze_image_encoder()
-            print(f"Using trained encoder from: {encoder_path}")
 
         self.deconv1 = nn.ConvTranspose2d(1024, 512, kernel_size=4, stride=2, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(512)
@@ -84,29 +117,44 @@ class Generator(nn.Module):
 
 
     def freeze_image_encoder(self):
+        if self.image_encoder is None:
+            return
         for param in self.image_encoder.parameters():
             param.requires_grad = False
         print("Image encoder frozen")
 
     def unfreeze_image_encoder(self):
+        if self.image_encoder is None:
+            return
         for param in self.image_encoder.parameters():
             param.requires_grad = True
         print("Image encoder unfrozen for fine-tuning")
 
-    def forward(self, noise, text, initial_image=None):
-      
-        text_emb = self.text_embedding(text)
+    def forward(self, noise, conditions, initial_image=None):
+        text_emb = self.text_embedding(conditions)
         noise_flat = noise.view(noise.shape[0], -1)
-        
-        if initial_image is not None:
-           
-            image_features = self.image_encoder(initial_image)
-            combined_features = torch.cat([noise_flat, text_emb, image_features['global']], dim=1)
+
+        image_features = None
+        if self.use_initial_image and self.image_encoder is not None and initial_image is not None:
+            if initial_image.shape[-1] != self.input_size or initial_image.shape[-2] != self.input_size:
+                initial_image = F.interpolate(
+                    initial_image,
+                    size=(self.input_size, self.input_size),
+                    mode='bilinear',
+                    align_corners=False
+                )
+            encoded = self.image_encoder(initial_image)
+            if isinstance(encoded, dict):
+                image_features = encoded.get('global', encoded)
+            else:
+                image_features = encoded
+
+        if image_features is not None:
+            combined_features = torch.cat([noise_flat, text_emb, image_features], dim=1)
             z = self.fc_with_image(combined_features)
         else:
             combined_features = torch.cat([noise_flat, text_emb], dim=1)
             z = self.fc_no_image(combined_features)
-            image_features = None
 
         z = z.view(z.shape[0], 1024, 4, 4)
 
@@ -122,13 +170,18 @@ class Generator(nn.Module):
         return z
 
 class Discriminator(nn.Module):
-    def __init__(self, conf):
+    def __init__(
+        self,
+        num_conditions: int = 9,
+        channels: int = 3,
+        embed_dim: int = 256,
+        embed_out_dim: int = 128
+    ):
         super(Discriminator, self).__init__()
-        self.channels = int(conf["image"]["n_channels"])
-        self.embed_dim = int(conf["model"]["embed_dim"])
-        self.embed_out_dim = int(conf["model"]["embed_out_dim"])
-        self.input_features = conf["dataset"]["input_features"].split(",")
-        self.input_dim = len(self.input_features)
+        self.channels = channels
+        self.embed_dim = embed_dim
+        self.embed_out_dim = embed_out_dim
+        self.input_dim = num_conditions
 
         self.conv1 = nn.Conv2d(self.channels, 32, 4, 2, 1)
         self.relu1 = nn.LeakyReLU(0.2, inplace=True)
@@ -161,7 +214,6 @@ class Discriminator(nn.Module):
         )
 
         self.output = nn.Conv2d(512 + self.embed_out_dim, 1, 4, 1, 0, bias=False)
-        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x, text):
         
@@ -180,8 +232,6 @@ class Discriminator(nn.Module):
         combined = torch.cat([x_out, text_emb], dim=1)
 
         out = self.output(combined)
-        out = self.sigmoid(out)
 
-        #x_out.view(batch_size, -1)
         return out.squeeze(), x_out
     

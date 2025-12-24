@@ -21,6 +21,15 @@ ENCODER_CHANNELS = [64, 128, 256, 256, 256]  # (only used for reference, actual 
 DECODER_CHANNELS = [1024, 512, 256, 128, 64, 32, 16]  # 7 levels for 4x4->512x512 (2^7 = 128x upsampling)
 CONDITION_HIDDEN_DIMS = [64, 128, 256]
 
+# GAN generator settings (used by train_gan.py)
+GAN_NOISE_DIM = 100
+GAN_EMBED_DIM = 256
+GAN_EMBED_OUT_DIM = 128
+GAN_CHANNELS = 3
+GAN_USE_INITIAL_IMAGE = True
+GAN_ADVERSARIAL_WEIGHT = 1.0
+GAN_DISCRIMINATOR_LR = 2e-4
+
 # Training settings
 BATCH_SIZE = 20 
 GRADIENT_ACCUMULATION_STEPS = 2  # Effective batch size = 80

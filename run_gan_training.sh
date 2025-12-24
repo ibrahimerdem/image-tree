@@ -1,21 +1,21 @@
 #!/bin/bash
 
-# Training Script for Conditional Image Generator
-# Usage: ./run_training.sh [num_gpus] [epochs] [checkpoint] [use_vae]
+# Training script for GAN generator
+# Usage: ./run_gan_training.sh [num_gpus] [epochs] [checkpoint] [disable_initial_image]
 
 set -e
 
 NUM_GPUS=${1:-2}
 NUM_EPOCHS=${2:-150}
 RESUME_CHECKPOINT=${3:-""}
-USE_VAE=${4:-"true"}
+DISABLE_INITIAL_IMAGE=${4:-"false"}
 
 echo "=========================================="
-echo "Image Generator - Distributed Training"
+echo "GAN Generator - Distributed Training"
 echo "=========================================="
 echo "GPUs: $NUM_GPUS"
 echo "Epochs: $NUM_EPOCHS"
-echo "VAE: $USE_VAE"
+[ "$DISABLE_INITIAL_IMAGE" = "true" ] && echo "Initial image conditioning: disabled" || echo "Initial image conditioning: enabled"
 [ -n "$RESUME_CHECKPOINT" ] && echo "Resume: $RESUME_CHECKPOINT"
 echo "=========================================="
 echo ""
@@ -36,17 +36,15 @@ mkdir -p checkpoints logs samples test_results
 
 [ -d ".venv" ] && source .venv/bin/activate
 
-# Build arguments
 ARGS="--epochs $NUM_EPOCHS"
-[ "$USE_VAE" = "true" ] && ARGS="$ARGS --use_vae"
+[ "$DISABLE_INITIAL_IMAGE" = "true" ] && ARGS="$ARGS --no_initial_image"
 [ -n "$RESUME_CHECKPOINT" ] && [ -f "$RESUME_CHECKPOINT" ] && ARGS="$ARGS --resume $RESUME_CHECKPOINT"
 
-# Run training
 if [ $NUM_GPUS -eq 1 ]; then
-    python3 train.py $ARGS
+    python3 train_gan.py $ARGS
 else
-    torchrun --nproc_per_node=$NUM_GPUS --nnodes=1 --standalone train.py $ARGS
+    torchrun --nproc_per_node=$NUM_GPUS --nnodes=1 --standalone train_gan.py $ARGS
 fi
 
 echo ""
-echo "✓ Training completed!"
+echo "✓ GAN training completed!"
