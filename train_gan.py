@@ -16,10 +16,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 import numpy as np
 
-from models.conditional_gan import Generator as GANGenerator, Discriminator as GANDiscriminator
+from models.conditional_gan import Generator, Discriminator
 from dataset import get_dataloaders
 from utils import (
-    save_checkpoint, load_checkpoint, calculate_psnr, calculate_ssim,
+    save_gan_checkpoint, load_gan_checkpoint, calculate_psnr, calculate_ssim,
     visualize_results, AverageMeter, EarlyStopping, count_parameters
 )
 import config as cfg
@@ -39,8 +39,6 @@ def get_args():
     parser.add_argument('--embed_dim', type=int, default=cfg.GAN_EMBED_DIM)
     parser.add_argument('--embed_out_dim', type=int, default=cfg.GAN_EMBED_OUT_DIM)
     parser.add_argument('--channels', type=int, default=cfg.GAN_CHANNELS)
-    parser.add_argument('--no_initial_image', action='store_true',
-                        help='Disable usage of initial images as generator input')
     parser.add_argument('--use_perceptual', action='store_true', default=True,
                         help='Use perceptual loss')
 
@@ -55,7 +53,7 @@ def get_args():
 
     # Multi-GPU
     parser.add_argument('--world_size', type=int, default=1, help='Number of GPUs')
-    parser.add_argument('--local-rank', '--local_rank', type=int, default=0)
+    parser.add_argument('--local_rank', type=int, default=0)
 
     # Paths
     parser.add_argument('--checkpoint_dir', type=str, default=cfg.CHECKPOINT_DIR)
@@ -104,75 +102,6 @@ class GANTrainingWrapper(nn.Module):
         noise = torch.randn(batch_size, self.noise_dim, device=conditions.device, dtype=conditions.dtype)
         init_img = initial_images if self.use_initial_image else None
         return self.generator(noise, conditions, init_img)
-
-
-def save_gan_checkpoint(
-    generator: nn.Module,
-    discriminator: nn.Module,
-    optimizer_g: optim.Optimizer,
-    optimizer_d: optim.Optimizer,
-    epoch: int,
-    loss: float,
-    filename: str,
-    scheduler_g=None,
-    scheduler_d=None
-):
-    checkpoint = {
-        'epoch': epoch,
-        'loss': loss,
-        'generator_state_dict': generator.state_dict(),
-        'discriminator_state_dict': discriminator.state_dict(),
-        'optimizer_g_state_dict': optimizer_g.state_dict(),
-        'optimizer_d_state_dict': optimizer_d.state_dict()
-    }
-
-    if scheduler_g is not None:
-        checkpoint['scheduler_g_state_dict'] = scheduler_g.state_dict()
-    if scheduler_d is not None:
-        checkpoint['scheduler_d_state_dict'] = scheduler_d.state_dict()
-
-    torch.save(checkpoint, filename)
-    print(f"Checkpoint saved: {filename}")
-
-
-def load_gan_checkpoint(
-    filename: str,
-    generator: nn.Module,
-    discriminator: nn.Module,
-    optimizer_g: optim.Optimizer = None,
-    optimizer_d: optim.Optimizer = None,
-    scheduler_g=None,
-    scheduler_d=None
-):
-    checkpoint = torch.load(filename, map_location='cpu', weights_only=False)
-    if 'generator_state_dict' in checkpoint:
-        generator.load_state_dict(checkpoint['generator_state_dict'])
-    else:
-        generator.load_state_dict(checkpoint['model_state_dict'])
-
-    if 'discriminator_state_dict' in checkpoint:
-        discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
-    else:
-        print("Warning: discriminator state not found in checkpoint; using current weights.")
-
-    if optimizer_g is not None:
-        key = 'optimizer_g_state_dict' if 'optimizer_g_state_dict' in checkpoint else 'optimizer_state_dict'
-        if key in checkpoint:
-            optimizer_g.load_state_dict(checkpoint[key])
-    if optimizer_d is not None:
-        if 'optimizer_d_state_dict' in checkpoint:
-            optimizer_d.load_state_dict(checkpoint['optimizer_d_state_dict'])
-
-    if scheduler_g is not None and 'scheduler_g_state_dict' in checkpoint:
-        scheduler_g.load_state_dict(checkpoint['scheduler_g_state_dict'])
-    if scheduler_d is not None and 'scheduler_d_state_dict' in checkpoint:
-        scheduler_d.load_state_dict(checkpoint['scheduler_d_state_dict'])
-
-    epoch = checkpoint.get('epoch', 0)
-    loss = checkpoint.get('loss', 0.0)
-
-    print(f"Checkpoint loaded: {filename} (epoch {epoch})")
-    return epoch, loss
 
 
 def setup_ddp(rank: int, world_size: int):
@@ -409,7 +338,7 @@ def validate(
 
 
 def train_worker(rank: int, world_size: int, args):
-    use_initial_image = cfg.GAN_USE_INITIAL_IMAGE and (not args.no_initial_image)
+    use_initial_image = cfg.GAN_USE_INITIAL_IMAGE
 
     if world_size > 1:
         setup_ddp(rank, world_size)
@@ -457,7 +386,7 @@ def train_worker(rank: int, world_size: int, args):
         print(f"✓ Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
         print("Creating model...")
 
-    generator = GANGenerator(
+    generator = Generator(
         num_conditions=args.num_conditions,
         noise_dim=args.noise_dim,
         embed_dim=args.embed_dim,
@@ -471,7 +400,7 @@ def train_worker(rank: int, world_size: int, args):
     ).to(device)
 
     model = GANTrainingWrapper(generator, args.noise_dim, use_initial_image).to(device)
-    discriminator = GANDiscriminator(
+    discriminator = Discriminator(
         num_conditions=args.num_conditions,
         channels=args.channels,
         embed_dim=args.embed_dim,
@@ -489,8 +418,8 @@ def train_worker(rank: int, world_size: int, args):
     if rank == 0:
         gen_params = count_parameters(model.module if world_size > 1 else model)
         disc_params = count_parameters(discriminator.module if world_size > 1 else discriminator)
-        print(f"✓ Generator parameters: {gen_params:,}")
-        print(f"✓ Discriminator parameters: {disc_params:,}")
+        print(f"Generator parameters: {gen_params:,}")
+        print(f"Discriminator parameters: {disc_params:,}")
 
     criterion_mse = nn.MSELoss()
     criterion_l1 = nn.L1Loss()
@@ -501,7 +430,7 @@ def train_worker(rank: int, world_size: int, args):
         from models.conditional import PerceptualLoss
         criterion_perceptual = PerceptualLoss().to(device)
         if rank == 0:
-            print("✓ Using perceptual loss")
+            print("Using perceptual loss")
 
     optimizer_g = optim.AdamW(
         model.parameters(),
@@ -529,14 +458,14 @@ def train_worker(rank: int, world_size: int, args):
 
     if rank == 0:
         metrics_logger = MetricsLogger(args.log_dir, cfg.METRICS_FILE)
-        print(f"✓ Metrics saved to: {os.path.join(args.log_dir, cfg.METRICS_FILE)}")
+        print(f"Metrics saved to: {os.path.join(args.log_dir, cfg.METRICS_FILE)}")
 
     start_epoch = 0
     best_val_loss = float('inf')
 
     if args.resume and os.path.exists(args.resume):
         if rank == 0:
-            print(f"✓ Resuming from: {args.resume}")
+            print(f"Resuming from: {args.resume}")
         start_epoch, best_val_loss = load_gan_checkpoint(
             args.resume,
             model.module if world_size > 1 else model,
@@ -626,12 +555,12 @@ def train_worker(rank: int, world_size: int, args):
                         optimizer_g, optimizer_d, epoch, val_metrics['loss'],
                         best_model_path, scheduler_g, scheduler_d
                     )
-                    print("✓ Best GAN model saved")
+                    print("Best GAN model saved")
 
                 last_val_loss = val_metrics['loss']
 
                 if early_stopping(val_metrics['loss']):
-                    print(f"\n✓ Early stopping at epoch {epoch + 1}")
+                    print(f"\nEarly stopping at epoch {epoch + 1}")
                     break
             else:
                 last_val_loss = train_metrics['loss']
@@ -649,7 +578,7 @@ def train_worker(rank: int, world_size: int, args):
                     optimizer_g, optimizer_d, epoch, loss_to_save,
                     checkpoint_path, scheduler_g, scheduler_d
                 )
-                print("✓ GAN checkpoint saved")
+                print("GAN checkpoint saved")
 
         if world_size > 1:
             dist.barrier()
@@ -666,9 +595,9 @@ def train_worker(rank: int, world_size: int, args):
             optimizer_g, optimizer_d, final_epoch, last_val_loss,
             final_model_path, scheduler_g, scheduler_d
         )
-        print("\n✓ GAN training completed!")
-        print(f"✓ Final GAN model saved: {final_model_path}")
-        print(f"✓ Best validation loss: {best_val_loss:.4f}")
+        print("\nGAN training completed!")
+        print(f"Final GAN model saved: {final_model_path}")
+        print(f"Best validation loss: {best_val_loss:.4f}")
 
     if world_size > 1:
         cleanup_ddp()

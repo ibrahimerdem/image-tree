@@ -161,7 +161,6 @@ class ConditionalGenerator(nn.Module):
     
     def __init__(
         self,
-        conf: Dict = None,
         num_conditions: int = 9,
         input_size: int = 128,
         output_size: int = 512,
@@ -176,9 +175,7 @@ class ConditionalGenerator(nn.Module):
         image_encoder_path: str = None,
         device: str = 'cuda:0',
         encoder_channels: List[int] = None,
-        use_checkpoint: bool = False,
         encoder_checkpoint: Optional[str] = None,
-        **unused_kwargs
     ):
         """
         Args:
@@ -198,14 +195,7 @@ class ConditionalGenerator(nn.Module):
             device: Device to use ('cuda:0', 'cpu', etc.)
         """
         super().__init__()
-        
-        if conf is not None:
-            num_conditions = len(conf.get("dataset", {}).get("input_features", "").split(","))
-            output_size = int(conf.get("image", {}).get("output_size", 512))
-            noise_dim = int(conf.get("model", {}).get("noise_dim", 100))
-            embed_dim = int(conf.get("model", {}).get("embed_dim", 256))
-            embed_out_dim = int(conf.get("model", {}).get("embed_out_dim", 128))
-        
+                
         self.num_conditions = num_conditions
         self.input_size = input_size
         self.output_size = output_size
@@ -224,26 +214,12 @@ class ConditionalGenerator(nn.Module):
         self.decoder_channels = decoder_channels
         self.condition_hidden_dims = condition_hidden_dims
         self.encoder_channels = encoder_channels
-        self.use_checkpoint = use_checkpoint
         
-        # ============ Condition Processing ============
-        # Text/feature embedding (from conditional_gan)
-        self.text_embedding = nn.Sequential(
-            nn.Linear(num_conditions, embed_dim),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(embed_dim, embed_out_dim),
-            nn.BatchNorm1d(embed_out_dim),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        
-        # Condition encoder (from conditional.py)
         self.condition_encoder = ConditionEncoder(
             num_conditions=num_conditions,
             hidden_dims=condition_hidden_dims
         )
-        
-        # ============ Image Encoder (Optional) ============
+
         self.image_encoder = None
         self.initial_image = initial_image
         
@@ -258,28 +234,22 @@ class ConditionalGenerator(nn.Module):
                     print(f"Warning: Could not load pretrained encoder from {image_encoder_path}: {exc}")
                     self.image_encoder = None
         
-        # ============ Noise Processing ============
-        # Different FC layers for with/without image features
         self.fc_no_image = nn.Linear(noise_dim + embed_out_dim, 1024 * 4 * 4)
-        
         if self.image_encoder:
             # 512 is typical for pretrained encoders
             self.fc_with_image = nn.Linear(noise_dim + embed_out_dim + 512, 1024 * 4 * 4)
         
-        # ============ Decoder (7 levels: 4x4 -> 512x512) ============
         self.decoder = Decoder(
             in_channels=1024,
             channels=decoder_channels,
             out_channels=3,
             use_attention=True
         )
-        
-        # ============ VAE Components ============
+
         if self.use_vae:
             self.vae_latent_dim = latent_dim
             self.mu_fc = nn.Linear(1024 * 4 * 4, latent_dim)
             self.logvar_fc = nn.Linear(1024 * 4 * 4, latent_dim)
-            # Remap latent back to spatial
             self.vae_to_spatial = nn.Linear(latent_dim, 1024 * 4 * 4)
     
     def freeze_image_encoder(self):
@@ -321,12 +291,10 @@ class ConditionalGenerator(nn.Module):
         # Generate random noise if not provided
         if noise is None:
             noise = torch.randn(batch_size, self.noise_dim, device=conditions.device)
+
+        encoded_conditions = self.condition_encoder(conditions)
+        noise_flat = noise.view(batch_size, -1)
         
-        # Embed conditions using text embedding (GAN-style)
-        text_emb = self.text_embedding(conditions)  # [B, embed_out_dim]
-        noise_flat = noise.view(batch_size, -1)  # [B, noise_dim]
-        
-        # Handle initial image features if provided
         image_features = None
         if initial_image is not None and self.image_encoder is not None:
             # Resize if needed
@@ -345,22 +313,21 @@ class ConditionalGenerator(nn.Module):
                 global_feat = global_feat.get('global', global_feat)
             
             image_features = global_feat
-            combined_features = torch.cat([noise_flat, text_emb, image_features], dim=1)
+            combined_features = torch.cat([noise_flat, encoded_conditions, image_features], dim=1)
             z = self.fc_with_image(combined_features)
         else:
-            combined_features = torch.cat([noise_flat, text_emb], dim=1)
+            combined_features = torch.cat([noise_flat, encoded_conditions], dim=1)
             z = self.fc_no_image(combined_features)
         
         # Reshape to spatial
-        z = z.view(batch_size, 1024, 4, 4)  # [B, 1024, 4, 4]
+        z = z.view(batch_size, 1024, 4, 4)
         
-        # ============ VAE Reparameterization (Optional) ============
         mu = None
         logvar = None
         if self.use_vae:
-            z_flat = z.view(batch_size, -1)  # [B, 16384]
-            mu = self.mu_fc(z_flat)  # [B, latent_dim]
-            logvar = self.logvar_fc(z_flat)  # [B, latent_dim]
+            z_flat = z.view(batch_size, -1)
+            mu = self.mu_fc(z_flat)
+            logvar = self.logvar_fc(z_flat)
             
             if self.training:
                 # Reparameterize during training
@@ -375,7 +342,6 @@ class ConditionalGenerator(nn.Module):
             z = self.vae_to_spatial(z_sample)
             z = z.view(batch_size, 1024, 4, 4)
         
-        # ============ Decode to output size ============
         output = self.decoder(z)
         
         if return_vae_params and self.use_vae:
@@ -404,10 +370,6 @@ class ConditionalGenerator(nn.Module):
             'trainable': trainable,
             'frozen': frozen
         }
-
-
-# Backwards compatibility alias used by training scripts
-ConditionalImageGenerator = ConditionalGenerator
 
 
 class TrainingModule(nn.Module):

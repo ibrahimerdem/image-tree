@@ -4,7 +4,6 @@ Training Script for Conditional Image Generator (conditional.py)
 """
 
 import os
-import sys
 import argparse
 import torch
 import torch.nn as nn
@@ -17,10 +16,8 @@ from tqdm import tqdm
 import numpy as np
 import csv
 from datetime import datetime
-from pathlib import Path
 
-# Import models
-from models.conditional import ConditionalImageGenerator, PerceptualLoss
+from models.conditional import ConditionalGenerator, PerceptualLoss
 from dataset import get_dataloaders
 from utils import (
     save_checkpoint, load_checkpoint, calculate_psnr, calculate_ssim,
@@ -55,7 +52,7 @@ def get_args():
     
     # Multi-GPU
     parser.add_argument('--world_size', type=int, default=1, help='Number of GPUs')
-    parser.add_argument('--local-rank', '--local_rank', type=int, default=0)
+    parser.add_argument('--local_rank', type=int, default=0)
     
     # Paths
     parser.add_argument('--checkpoint_dir', type=str, default=cfg.CHECKPOINT_DIR)
@@ -348,13 +345,13 @@ def train_worker(rank: int, world_size: int, args):
     )
     
     if rank == 0:
-        print(f"✓ Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+        print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
     
     # Create model
     if rank == 0:
         print("Creating model...")
     
-    model = ConditionalImageGenerator(
+    model = ConditionalGenerator(
         num_conditions=args.num_conditions,
         input_size=args.input_size,
         output_size=args.output_size,
@@ -378,7 +375,7 @@ def train_worker(rank: int, world_size: int, args):
     
     if rank == 0:
         param_count = count_parameters(model.module if world_size > 1 else model)
-        print(f"✓ Total parameters: {param_count:,}")
+        print(f"Total parameters: {param_count:,}")
     
     # Loss functions
     criterion_mse = nn.MSELoss()
@@ -388,7 +385,7 @@ def train_worker(rank: int, world_size: int, args):
     if args.use_perceptual:
         criterion_perceptual = PerceptualLoss().to(device)
         if rank == 0:
-            print("✓ Using perceptual loss")
+            print("Using perceptual loss")
     
     # Optimizer
     optimizer = optim.AdamW(
@@ -411,7 +408,7 @@ def train_worker(rank: int, world_size: int, args):
     # Logger
     if rank == 0:
         metrics_logger = MetricsLogger(args.log_dir, cfg.METRICS_FILE)
-        print(f"✓ Metrics saved to: {os.path.join(args.log_dir, cfg.METRICS_FILE)}")
+        print(f"Metrics saved to: {os.path.join(args.log_dir, cfg.METRICS_FILE)}")
     
     # Resume
     start_epoch = 0
@@ -419,7 +416,7 @@ def train_worker(rank: int, world_size: int, args):
     
     if args.resume and os.path.exists(args.resume):
         if rank == 0:
-            print(f"✓ Resuming from: {args.resume}")
+            print(f"Resuming from: {args.resume}")
         start_epoch, best_val_loss = load_checkpoint(
             args.resume, 
             model.module if world_size > 1 else model, 
@@ -497,12 +494,12 @@ def train_worker(rank: int, world_size: int, args):
                         optimizer, epoch, val_metrics['loss'],
                         best_model_path, scheduler
                     )
-                    print(f"✓ Best model saved")
+                    print(f"Best model saved")
                 
                 last_val_loss = val_metrics['loss']
                 
                 if early_stopping(val_metrics['loss']):
-                    print(f"\n✓ Early stopping at epoch {epoch + 1}")
+                    print(f"\nEarly stopping at epoch {epoch + 1}")
                     break
             else:
                 print(f"Epoch {epoch+1}/{args.epochs} - Train Loss: {train_metrics['loss']:.4f}")
@@ -515,7 +512,7 @@ def train_worker(rank: int, world_size: int, args):
                     optimizer, epoch, loss_to_save,
                     checkpoint_path, scheduler
                 )
-                print(f"✓ Checkpoint saved")
+                print(f"Checkpoint saved")
         
         if world_size > 1:
             dist.barrier()
@@ -532,9 +529,9 @@ def train_worker(rank: int, world_size: int, args):
             optimizer, final_epoch, last_val_loss,
             final_model_path, scheduler
         )
-        print("\n✓ Training completed!")
-        print(f"✓ Final model saved: {final_model_path}")
-        print(f"✓ Best validation loss: {best_val_loss:.4f}")
+        print("\nTraining completed!")
+        print(f"Final model saved: {final_model_path}")
+        print(f"Best validation loss: {best_val_loss:.4f}")
     
     if world_size > 1:
         cleanup_ddp()

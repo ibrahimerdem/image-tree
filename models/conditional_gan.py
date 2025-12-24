@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional
+from .pretrained_encoder import PretrainedEncoderWrapper 
 
     
 class SelfAttention(nn.Module):
@@ -28,7 +29,6 @@ class SelfAttention(nn.Module):
 class Generator(nn.Module):
     def __init__(
         self,
-        conf: Optional[Dict] = None,
         num_conditions: int = 9,
         noise_dim: int = 100,
         embed_dim: int = 256,
@@ -43,19 +43,6 @@ class Generator(nn.Module):
     ):
         super().__init__()
 
-        if conf is not None:
-            channels = int(conf.get("image", {}).get("n_channels", channels))
-            noise_dim = int(conf.get("model", {}).get("noise_dim", noise_dim))
-            embed_dim = int(conf.get("model", {}).get("embed_dim", embed_dim))
-            embed_out_dim = int(conf.get("model", {}).get("embed_out_dim", embed_out_dim))
-            input_features = conf.get("dataset", {}).get("input_features", "")
-            if input_features:
-                num_conditions = len(input_features.split(","))
-            encoder_cfg = conf.get("model", {}).get("image_encoder", {})
-            use_initial_image = encoder_cfg.get("encoder_type") is not None or use_initial_image
-            encoder_checkpoint = encoder_cfg.get("encoder_path", encoder_checkpoint)
-            freeze_encoder = encoder_cfg.get("freeze_encoder", freeze_encoder)
-
         self.channels = channels
         self.noise_dim = noise_dim
         self.embed_dim = embed_dim
@@ -68,7 +55,6 @@ class Generator(nn.Module):
         self.image_encoder = image_encoder if self.use_initial_image else None
         if self.use_initial_image and self.image_encoder is None and encoder_checkpoint:
             try:
-                from .pretrained_encoder import PretrainedEncoderWrapper
                 self.image_encoder = PretrainedEncoderWrapper(encoder_checkpoint, device=device)
             except Exception as exc:
                 print(f"Warning: Failed to load pretrained encoder from {encoder_checkpoint}: {exc}")

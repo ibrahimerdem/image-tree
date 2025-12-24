@@ -4,8 +4,6 @@ DATA_DIR = './data'
 INPUT_SIZE = 128
 OUTPUT_SIZE = 512 
 NUM_CONDITIONS = 9
-
-# Dataset structure - shared images, separate feature files
 INITIAL_DIR = 'initial'  
 TARGET_DIR = 'target'    
 TRAIN_FEATURES = 'training_features.csv'
@@ -21,7 +19,7 @@ ENCODER_CHANNELS = [64, 128, 256, 256, 256]  # (only used for reference, actual 
 DECODER_CHANNELS = [1024, 512, 256, 128, 64, 32, 16]  # 7 levels for 4x4->512x512 (2^7 = 128x upsampling)
 CONDITION_HIDDEN_DIMS = [64, 128, 256]
 
-# GAN generator settings (used by train_gan.py)
+# GAN generator settings
 GAN_NOISE_DIM = 100
 GAN_EMBED_DIM = 256
 GAN_EMBED_OUT_DIM = 128

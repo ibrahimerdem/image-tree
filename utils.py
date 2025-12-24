@@ -56,6 +56,72 @@ def load_checkpoint(
     print(f"Checkpoint loaded: {filename} (epoch {epoch})")
     return epoch, loss
 
+def save_gan_checkpoint(
+    generator: torch.nn.Module,
+    discriminator: torch.nn.Module,
+    optimizer_g: torch.optim.Optimizer,
+    optimizer_d: torch.optim.Optimizer,
+    epoch: int,
+    loss: float,
+    filename: str,
+    scheduler_g=None,
+    scheduler_d=None
+):
+    checkpoint = {
+        'epoch': epoch,
+        'loss': loss,
+        'generator_state_dict': generator.state_dict(),
+        'discriminator_state_dict': discriminator.state_dict(),
+        'optimizer_g_state_dict': optimizer_g.state_dict(),
+        'optimizer_d_state_dict': optimizer_d.state_dict()
+    }
+
+    if scheduler_g is not None:
+        checkpoint['scheduler_g_state_dict'] = scheduler_g.state_dict()
+    if scheduler_d is not None:
+        checkpoint['scheduler_d_state_dict'] = scheduler_d.state_dict()
+
+    torch.save(checkpoint, filename)
+    print(f"Checkpoint saved: {filename}")
+
+def load_gan_checkpoint(
+    filename: str,
+    generator: torch.nn.Module,
+    discriminator: torch.nn.Module,
+    optimizer_g: torch.optim.Optimizer = None,
+    optimizer_d: torch.optim.Optimizer = None,
+    scheduler_g=None,
+    scheduler_d=None
+):
+    checkpoint = torch.load(filename, map_location='cpu', weights_only=False)
+    if 'generator_state_dict' in checkpoint:
+        generator.load_state_dict(checkpoint['generator_state_dict'])
+    else:
+        generator.load_state_dict(checkpoint['model_state_dict'])
+
+    if 'discriminator_state_dict' in checkpoint:
+        discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+    else:
+        print("Warning: discriminator state not found in checkpoint; using current weights.")
+
+    if optimizer_g is not None:
+        key = 'optimizer_g_state_dict' if 'optimizer_g_state_dict' in checkpoint else 'optimizer_state_dict'
+        if key in checkpoint:
+            optimizer_g.load_state_dict(checkpoint[key])
+    if optimizer_d is not None:
+        if 'optimizer_d_state_dict' in checkpoint:
+            optimizer_d.load_state_dict(checkpoint['optimizer_d_state_dict'])
+
+    if scheduler_g is not None and 'scheduler_g_state_dict' in checkpoint:
+        scheduler_g.load_state_dict(checkpoint['scheduler_g_state_dict'])
+    if scheduler_d is not None and 'scheduler_d_state_dict' in checkpoint:
+        scheduler_d.load_state_dict(checkpoint['scheduler_d_state_dict'])
+
+    epoch = checkpoint.get('epoch', 0)
+    loss = checkpoint.get('loss', 0.0)
+
+    print(f"Checkpoint loaded: {filename} (epoch {epoch})")
+    return epoch, loss
 
 def denormalize_image(image: torch.Tensor) -> torch.Tensor:
     """Denormalize image from [-1, 1] to [0, 1]"""
