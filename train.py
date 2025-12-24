@@ -12,7 +12,7 @@ import numpy as np
 import csv
 from datetime import datetime
 
-from model import ConditionalImageGenerator, PerceptualLoss
+from models.conditional import ConditionalImageGenerator, PerceptualLoss
 from dataset import get_dataloaders
 from utils import (
     save_checkpoint, load_checkpoint, calculate_psnr, calculate_ssim,
