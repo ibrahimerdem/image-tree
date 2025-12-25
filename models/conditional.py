@@ -165,8 +165,6 @@ class ConditionalGenerator(nn.Module):
         input_size: int = 128,
         output_size: int = 512,
         noise_dim: int = 100,
-        embed_dim: int = 256,
-        embed_out_dim: int = 128,
         latent_dim: int = 256,
         decoder_channels: List[int] = None,
         condition_hidden_dims: List[int] = None,
@@ -184,8 +182,6 @@ class ConditionalGenerator(nn.Module):
             input_size: Input image size (for pretrained encoder)
             output_size: Output image size
             noise_dim: Noise vector dimension
-            embed_dim: Initial embedding dimension
-            embed_out_dim: Output embedding dimension
             latent_dim: Latent space dimension
             decoder_channels: Channels for decoder upsampling
             condition_hidden_dims: Hidden dimensions for condition encoder
@@ -200,8 +196,6 @@ class ConditionalGenerator(nn.Module):
         self.input_size = input_size
         self.output_size = output_size
         self.noise_dim = noise_dim
-        self.embed_dim = embed_dim
-        self.embed_out_dim = embed_out_dim
         self.latent_dim = latent_dim
         self.use_vae = use_vae
         self.device = device
@@ -234,10 +228,10 @@ class ConditionalGenerator(nn.Module):
                     print(f"Warning: Could not load pretrained encoder from {image_encoder_path}: {exc}")
                     self.image_encoder = None
         
-        self.fc_no_image = nn.Linear(noise_dim + embed_out_dim, 1024 * 4 * 4)
+        self.fc_no_image = nn.Linear(noise_dim + condition_hidden_dims[-1], 1024 * 4 * 4)
         if self.image_encoder:
             # 512 is typical for pretrained encoders
-            self.fc_with_image = nn.Linear(noise_dim + embed_out_dim + 512, 1024 * 4 * 4)
+            self.fc_with_image = nn.Linear(noise_dim + condition_hidden_dims[-1] + 512, 1024 * 4 * 4)
         
         self.decoder = Decoder(
             in_channels=1024,

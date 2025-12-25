@@ -142,13 +142,9 @@ def train_epoch(
         with autocast(device_type='cuda', enabled=cfg.USE_AMP):
             # Forward pass
             if use_vae:
-                out = model(initial_images, conditions)
-                if isinstance(out, tuple):
-                    generated_images, mu, logvar = out
-                else:
-                    generated_images = out
-                    mu = None
-                    logvar = None
+                generated_images, mu, logvar = model(
+                    initial_images, conditions, return_vae_params=True
+                )
             else:
                 generated_images = model(initial_images, conditions)
                 mu = None
@@ -360,7 +356,7 @@ def train_worker(rank: int, world_size: int, args):
         decoder_channels=cfg.DECODER_CHANNELS,
         condition_hidden_dims=cfg.CONDITION_HIDDEN_DIMS,
         use_vae=args.use_vae,
-        use_checkpoint=True,
+        initial_image=True,
         encoder_checkpoint=cfg.ENCODER_CHECKPOINT,
         device=f'cuda:{rank}'
     ).to(device)
@@ -399,7 +395,8 @@ def train_worker(rank: int, world_size: int, args):
     def lr_lambda(epoch):
         if epoch < cfg.WARMUP_EPOCHS:
             return (epoch + 1) / cfg.WARMUP_EPOCHS
-        return 0.5 * (1 + np.cos(np.pi * (epoch - cfg.WARMUP_EPOCHS) / (args.epochs - cfg.WARMUP_EPOCHS)))
+        decay_span = max(1, args.epochs - cfg.WARMUP_EPOCHS)
+        return 0.5 * (1 + np.cos(np.pi * (epoch - cfg.WARMUP_EPOCHS) / decay_span))
     
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler = GradScaler(device='cuda', enabled=cfg.USE_AMP)
