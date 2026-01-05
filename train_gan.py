@@ -5,6 +5,8 @@ import os
 import argparse
 import csv
 from datetime import datetime
+import runpy
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -16,52 +18,49 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 import numpy as np
 
+import config as default_cfg
 from models.conditional_gan import Generator, Discriminator
 from dataset import get_dataloaders
 from utils import (
     save_gan_checkpoint, load_gan_checkpoint, calculate_psnr, calculate_ssim,
     visualize_results, AverageMeter, EarlyStopping, count_parameters
 )
-import config as cfg
+
+cfg = default_cfg
+
+
+def load_config_module(config_path: str):
+    if not config_path:
+        return default_cfg
+
+    resolved_path = os.path.abspath(config_path)
+    default_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'config.py'))
+
+    if resolved_path == default_path:
+        return default_cfg
+
+    if not os.path.exists(resolved_path):
+        raise FileNotFoundError(f"Config file not found: {resolved_path}")
+
+    config_data = runpy.run_path(resolved_path)
+    filtered = {k: v for k, v in config_data.items() if not k.startswith('__')}
+    return SimpleNamespace(**filtered)
 
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train GAN-based Conditional Image Generator (128->512)')
+    parser.add_argument('--config', type=str, default='config.py', help='Path to config module')
+    parser.add_argument('--epochs', type=int, default=None, help='Override epoch count from config')
 
-    # Data
-    parser.add_argument('--data_dir', type=str, default=cfg.DATA_DIR)
-    parser.add_argument('--input_size', type=int, default=cfg.INPUT_SIZE)
-    parser.add_argument('--output_size', type=int, default=cfg.OUTPUT_SIZE)
-    parser.add_argument('--num_conditions', type=int, default=cfg.NUM_CONDITIONS)
+    cli_args = parser.parse_args()
 
-    # Generator parameters
-    parser.add_argument('--noise_dim', type=int, default=cfg.GAN_NOISE_DIM)
-    parser.add_argument('--embed_dim', type=int, default=cfg.GAN_EMBED_DIM)
-    parser.add_argument('--embed_out_dim', type=int, default=cfg.GAN_EMBED_OUT_DIM)
-    parser.add_argument('--channels', type=int, default=cfg.GAN_CHANNELS)
-    parser.add_argument('--use_perceptual', action='store_true', default=True,
-                        help='Use perceptual loss')
+    global cfg
+    cfg = load_config_module(cli_args.config)
 
-    # Training
-    parser.add_argument('--batch_size', type=int, default=cfg.BATCH_SIZE)
-    parser.add_argument('--epochs', type=int, default=cfg.NUM_EPOCHS)
-    parser.add_argument('--lr', type=float, default=cfg.LEARNING_RATE)
-    parser.add_argument('--disc_lr', type=float, default=cfg.GAN_DISCRIMINATOR_LR)
-    parser.add_argument('--num_workers', type=int, default=cfg.NUM_WORKERS)
-    parser.add_argument('--gradient_accumulation', type=int, default=cfg.GRADIENT_ACCUMULATION_STEPS)
-    parser.add_argument('--adv_weight', type=float, default=cfg.GAN_ADVERSARIAL_WEIGHT)
-
-    # Multi-GPU
-    parser.add_argument('--world_size', type=int, default=1, help='Number of GPUs')
-    parser.add_argument('--local_rank', type=int, default=0)
-
-    # Paths
-    parser.add_argument('--checkpoint_dir', type=str, default=cfg.CHECKPOINT_DIR)
-    parser.add_argument('--log_dir', type=str, default=cfg.LOG_DIR)
-    parser.add_argument('--sample_dir', type=str, default=cfg.SAMPLE_DIR)
-    parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
-
-    return parser.parse_args()
+    args = argparse.Namespace()
+    args.config_path = os.path.abspath(cli_args.config)
+    args.epochs = cli_args.epochs
+    return args
 
 
 class MetricsLogger:
@@ -337,8 +336,20 @@ def validate(
     }
 
 
-def train_worker(rank: int, world_size: int, args):
-    use_initial_image = cfg.GAN_USE_INITIAL_IMAGE
+def train_worker(rank: int, world_size: int, total_epochs: int):
+    use_initial_image = bool(getattr(cfg, 'GAN_USE_INITIAL_IMAGE', True))
+    use_perceptual = bool(getattr(cfg, 'GAN_USE_PERCEPTUAL', True))
+    batch_size = cfg.BATCH_SIZE
+    input_size = cfg.INPUT_SIZE
+    output_size = cfg.OUTPUT_SIZE
+    noise_dim = cfg.GAN_NOISE_DIM
+    embed_dim = cfg.GAN_EMBED_DIM
+    embed_out_dim = cfg.GAN_EMBED_OUT_DIM
+    channels = cfg.GAN_CHANNELS
+    adv_weight = cfg.GAN_ADVERSARIAL_WEIGHT
+    gradient_accumulation = cfg.GRADIENT_ACCUMULATION_STEPS
+    num_workers = cfg.NUM_WORKERS
+    resume_path = getattr(cfg, 'GAN_RESUME_CHECKPOINT', getattr(cfg, 'RESUME_CHECKPOINT', None))
 
     if world_size > 1:
         setup_ddp(rank, world_size)
@@ -346,36 +357,36 @@ def train_worker(rank: int, world_size: int, args):
     device = torch.device(f'cuda:{rank}')
 
     if rank == 0:
-        os.makedirs(args.checkpoint_dir, exist_ok=True)
-        os.makedirs(args.log_dir, exist_ok=True)
-        os.makedirs(args.sample_dir, exist_ok=True)
+        os.makedirs(cfg.CHECKPOINT_DIR, exist_ok=True)
+        os.makedirs(cfg.LOG_DIR, exist_ok=True)
+        os.makedirs(cfg.SAMPLE_DIR, exist_ok=True)
         print(f"\n{'='*80}")
         print("GAN Training Configuration")
         print(f"{'='*80}")
         print(f"GPUs: {world_size}")
-        print(f"Input size: {args.input_size}x{args.input_size}")
-        print(f"Output size: {args.output_size}x{args.output_size}")
-        print(f"Noise dim: {args.noise_dim}")
+        print(f"Input size: {input_size}x{input_size}")
+        print(f"Output size: {output_size}x{output_size}")
+        print(f"Noise dim: {noise_dim}")
         print(f"Use initial image: {use_initial_image}")
-        print(f"Batch size per GPU: {args.batch_size}")
-        print(f"Effective batch size: {args.batch_size * world_size * args.gradient_accumulation}")
-        print(f"Adv. weight: {args.adv_weight}")
-        print(f"LR (G/D): {args.lr} / {args.disc_lr}")
+        print(f"Batch size per GPU: {batch_size}")
+        print(f"Effective batch size: {batch_size * world_size * gradient_accumulation}")
+        print(f"Adv. weight: {adv_weight}")
+        print(f"LR (G/D): {cfg.LEARNING_RATE} / {cfg.GAN_DISCRIMINATOR_LR}")
         print(f"{'='*80}\n")
 
     if rank == 0:
         print("Loading datasets...")
 
     train_loader, val_loader, _ = get_dataloaders(
-        data_dir=args.data_dir,
+        data_dir=cfg.DATA_DIR,
         train_features=cfg.TRAIN_FEATURES,
         val_features=cfg.VAL_FEATURES,
         initial_dir=cfg.INITIAL_DIR,
         target_dir=cfg.TARGET_DIR,
-        batch_size=args.batch_size,
-        input_size=args.input_size,
-        output_size=args.output_size,
-        num_workers=args.num_workers,
+        batch_size=batch_size,
+        input_size=input_size,
+        output_size=output_size,
+        num_workers=num_workers,
         pin_memory=True,
         distributed=(world_size > 1),
         rank=rank,
@@ -387,24 +398,24 @@ def train_worker(rank: int, world_size: int, args):
         print("Creating model...")
 
     generator = Generator(
-        num_conditions=args.num_conditions,
-        noise_dim=args.noise_dim,
-        embed_dim=args.embed_dim,
-        embed_out_dim=args.embed_out_dim,
-        channels=args.channels,
+        num_conditions=cfg.NUM_CONDITIONS,
+        noise_dim=noise_dim,
+        embed_dim=embed_dim,
+        embed_out_dim=embed_out_dim,
+        channels=channels,
         use_initial_image=use_initial_image,
         encoder_checkpoint=cfg.ENCODER_CHECKPOINT,
         freeze_encoder=True,
-        input_size=args.input_size,
+        input_size=input_size,
         device=f'cuda:{rank}'
     ).to(device)
 
-    model = GANTrainingWrapper(generator, args.noise_dim, use_initial_image).to(device)
+    model = GANTrainingWrapper(generator, noise_dim, use_initial_image).to(device)
     discriminator = Discriminator(
-        num_conditions=args.num_conditions,
-        channels=args.channels,
-        embed_dim=args.embed_dim,
-        embed_out_dim=args.embed_out_dim
+        num_conditions=cfg.NUM_CONDITIONS,
+        channels=channels,
+        embed_dim=embed_dim,
+        embed_out_dim=embed_out_dim
     ).to(device)
 
     if world_size > 1 and cfg.SYNC_BATCHNORM:
@@ -426,7 +437,7 @@ def train_worker(rank: int, world_size: int, args):
     criterion_perceptual = None
     criterion_adv = nn.BCEWithLogitsLoss()
 
-    if args.use_perceptual:
+    if use_perceptual:
         from models.conditional import PerceptualLoss
         criterion_perceptual = PerceptualLoss().to(device)
         if rank == 0:
@@ -434,13 +445,13 @@ def train_worker(rank: int, world_size: int, args):
 
     optimizer_g = optim.AdamW(
         model.parameters(),
-        lr=args.lr,
+        lr=cfg.LEARNING_RATE,
         weight_decay=cfg.WEIGHT_DECAY,
         betas=(0.9, 0.999)
     )
     optimizer_d = optim.AdamW(
         discriminator.parameters(),
-        lr=args.disc_lr,
+        lr=cfg.GAN_DISCRIMINATOR_LR,
         weight_decay=cfg.WEIGHT_DECAY,
         betas=(0.9, 0.999)
     )
@@ -448,7 +459,7 @@ def train_worker(rank: int, world_size: int, args):
     def lr_lambda(epoch):
         if epoch < cfg.WARMUP_EPOCHS:
             return (epoch + 1) / cfg.WARMUP_EPOCHS
-        return 0.5 * (1 + np.cos(np.pi * (epoch - cfg.WARMUP_EPOCHS) / max(1, args.epochs - cfg.WARMUP_EPOCHS)))
+        return 0.5 * (1 + np.cos(np.pi * (epoch - cfg.WARMUP_EPOCHS) / max(1, total_epochs - cfg.WARMUP_EPOCHS)))
 
     scheduler_g = optim.lr_scheduler.LambdaLR(optimizer_g, lr_lambda)
     scheduler_d = optim.lr_scheduler.LambdaLR(optimizer_d, lr_lambda)
@@ -457,17 +468,17 @@ def train_worker(rank: int, world_size: int, args):
     early_stopping = EarlyStopping(patience=cfg.EARLY_STOP_PATIENCE)
 
     if rank == 0:
-        metrics_logger = MetricsLogger(args.log_dir, cfg.METRICS_FILE)
-        print(f"Metrics saved to: {os.path.join(args.log_dir, cfg.METRICS_FILE)}")
+        metrics_logger = MetricsLogger(cfg.LOG_DIR, cfg.METRICS_FILE)
+        print(f"Metrics saved to: {os.path.join(cfg.LOG_DIR, cfg.METRICS_FILE)}")
 
     start_epoch = 0
     best_val_loss = float('inf')
 
-    if args.resume and os.path.exists(args.resume):
+    if resume_path and os.path.exists(resume_path):
         if rank == 0:
-            print(f"Resuming from: {args.resume}")
+            print(f"Resuming from: {resume_path}")
         start_epoch, best_val_loss = load_gan_checkpoint(
-            args.resume,
+            resume_path,
             model.module if world_size > 1 else model,
             discriminator.module if world_size > 1 else discriminator,
             optimizer_g,
@@ -483,22 +494,22 @@ def train_worker(rank: int, world_size: int, args):
     last_val_loss = best_val_loss
     last_trained_epoch = start_epoch - 1
 
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in range(start_epoch, total_epochs):
         if world_size > 1:
             train_loader.sampler.set_epoch(epoch)
 
         train_metrics = train_epoch(
             model, discriminator, train_loader, criterion_mse, criterion_l1, criterion_perceptual,
             criterion_adv, optimizer_g, optimizer_d, device, scaler_g, scaler_d,
-            epoch, args.gradient_accumulation, rank, args.use_perceptual, args.adv_weight
+            epoch, gradient_accumulation, rank, use_perceptual, adv_weight
         )
 
-        should_validate = (epoch + 1) % cfg.VALIDATION_FREQUENCY == 0 or (epoch + 1) == args.epochs
+        should_validate = (epoch + 1) % cfg.VALIDATION_FREQUENCY == 0 or (epoch + 1) == total_epochs
 
         if should_validate:
             val_metrics = validate(
                 model, val_loader, criterion_mse, criterion_l1, criterion_perceptual,
-                device, epoch, rank, args.use_perceptual
+                device, epoch, rank, use_perceptual
             )
         else:
             val_metrics = None
@@ -528,7 +539,7 @@ def train_worker(rank: int, world_size: int, args):
 
                 if cfg.SAVE_SAMPLES:
                     sample_initials, sample_generated, sample_targets = val_metrics['samples']
-                    sample_path = os.path.join(args.sample_dir, f'gan_epoch_{epoch+1:04d}.png')
+                    sample_path = os.path.join(cfg.SAMPLE_DIR, f'gan_epoch_{epoch+1:04d}.png')
                     visualize_results(
                         sample_initials, sample_generated, sample_targets,
                         num_samples=cfg.NUM_SAMPLE_IMAGES, save_path=sample_path
@@ -536,7 +547,7 @@ def train_worker(rank: int, world_size: int, args):
 
                 print(f"\n{'='*80}")
                 print(
-                    f"Epoch {epoch+1}/{args.epochs} - "
+                    f"Epoch {epoch+1}/{total_epochs} - "
                     f"G Loss: {train_metrics['loss']:.4f} | D Loss: {train_metrics['disc_loss']:.4f} | "
                     f"Val Loss: {val_metrics['loss']:.4f}"
                 )
@@ -548,7 +559,7 @@ def train_worker(rank: int, world_size: int, args):
 
                 if val_metrics['loss'] < best_val_loss:
                     best_val_loss = val_metrics['loss']
-                    best_model_path = os.path.join(args.checkpoint_dir, 'gan_best_model.pth')
+                    best_model_path = os.path.join(cfg.CHECKPOINT_DIR, 'gan_best_model.pth')
                     save_gan_checkpoint(
                         model.module if world_size > 1 else model,
                         discriminator.module if world_size > 1 else discriminator,
@@ -565,12 +576,12 @@ def train_worker(rank: int, world_size: int, args):
             else:
                 last_val_loss = train_metrics['loss']
                 print(
-                    f"Epoch {epoch+1}/{args.epochs} - "
+                    f"Epoch {epoch+1}/{total_epochs} - "
                     f"G Loss: {train_metrics['loss']:.4f} | D Loss: {train_metrics['disc_loss']:.4f}"
                 )
 
             if (epoch + 1) % cfg.SAVE_FREQUENCY == 0:
-                checkpoint_path = os.path.join(args.checkpoint_dir, f'gan_checkpoint_epoch_{epoch+1:04d}.pth')
+                checkpoint_path = os.path.join(cfg.CHECKPOINT_DIR, f'gan_checkpoint_epoch_{epoch+1:04d}.pth')
                 loss_to_save = val_metrics['loss'] if should_validate else train_metrics['loss']
                 save_gan_checkpoint(
                     model.module if world_size > 1 else model,
@@ -588,7 +599,7 @@ def train_worker(rank: int, world_size: int, args):
 
     if rank == 0:
         final_epoch = last_trained_epoch if last_trained_epoch >= 0 else max(start_epoch - 1, 0)
-        final_model_path = os.path.join(args.checkpoint_dir, 'gan_final_model.pth')
+        final_model_path = os.path.join(cfg.CHECKPOINT_DIR, 'gan_final_model.pth')
         save_gan_checkpoint(
             model.module if world_size > 1 else model,
             discriminator.module if world_size > 1 else discriminator,
@@ -605,16 +616,18 @@ def train_worker(rank: int, world_size: int, args):
 
 def main():
     args = get_args()
+    total_epochs = args.epochs if args.epochs is not None else cfg.NUM_EPOCHS
+    configured_world_size = getattr(cfg, 'WORLD_SIZE', 1)
 
     if 'LOCAL_RANK' in os.environ:
         local_rank = int(os.environ['LOCAL_RANK'])
         world_size = int(os.environ['WORLD_SIZE'])
         print(f"Using torchrun: rank={local_rank}, world_size={world_size}")
-        train_worker(local_rank, world_size, args)
-    elif args.world_size > 1:
-        mp.spawn(train_worker, args=(args.world_size, args), nprocs=args.world_size, join=True)
+        train_worker(local_rank, world_size, total_epochs)
+    elif configured_world_size > 1:
+        mp.spawn(train_worker, args=(configured_world_size, total_epochs), nprocs=configured_world_size, join=True)
     else:
-        train_worker(0, 1, args)
+        train_worker(0, 1, total_epochs)
 
 
 if __name__ == "__main__":

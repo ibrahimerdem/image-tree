@@ -27,6 +27,7 @@ GAN_CHANNELS = 3
 GAN_USE_INITIAL_IMAGE = True
 GAN_ADVERSARIAL_WEIGHT = 1.0
 GAN_DISCRIMINATOR_LR = 2e-4
+GAN_USE_PERCEPTUAL = True
 
 # Training settings
 BATCH_SIZE = 20 
@@ -35,6 +36,7 @@ NUM_EPOCHS = 150
 LEARNING_RATE = 3e-4 
 WEIGHT_DECAY = 1e-5
 NUM_WORKERS = 8
+USE_PERCEPTUAL_LOSS = True
 
 # Loss weights - deterministic output with emphasis on sharpness
 # Total loss = RECONSTRUCTION_WEIGHT*MSE + L1_WEIGHT*L1 + PERCEPTUAL_WEIGHT*Perceptual + KL (when VAE enabled)
